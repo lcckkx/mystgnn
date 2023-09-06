@@ -1,224 +1,233 @@
-import logging
-import os
+import time
+from dataloader import DataGenerator,generate_file,sliding_window,norm,load_adj,origin_window
+from model.model import TemporalGNN
 import argparse
-import math
-import random
-import tqdm
-import numpy as np
-import pandas as pd
-import yaml
-from sklearn import preprocessing
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torch.utils as utils
-from script import dataloader, utility, earlystopping
-from model import models
 from envs import get_env
-from script.dataloader import DataGenerator,generate_file,Emulator
-from envs.scenario.shunqing import shunqing
-
-
-# import nni
-
-def set_env(seed):
-    # Set available CUDA devices
-    # This option is crucial for an multi-GPU device
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-    # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-    # os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':16:8'
-    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(True)
-
+import numpy as np
+import os
+import torch
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+# import os
+# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+device = torch.device("cuda")
 
 def get_parameters():
     parser = argparse.ArgumentParser()
+    # Whole situation, SWMM
     parser.add_argument('--env', default='shunqing', help='drainage scenarios')
-    parser.add_argument('--simulate', action="store_true", help='if simulate rainfall events for training data')
     parser.add_argument('--data_dir', type=str, default='./envs/data/shunqing/', help='the sampling data file')
     parser.add_argument('--ratio', type=float, default=0.8, help='ratio of training events')
-    parser.add_argument('--processes', type=int, default=1, help='number of simulation processes')
+    parser.add_argument('--processes', type=int, default=5, help='number of simulation processes')
+    parser.add_argument('--act', default=True, help='if the environment contains control actions')
+    parser.add_argument('--seq', default=True, help='seq')
+    parser.add_argument('--hmax', default=np.array([1.5 for _ in range(105, 4)]), help='hmax')
+    parser.add_argument('--seq_in', type=int, default=12, help='==n_his')
+    parser.add_argument('--seq_out', type=int, default=12,
+                        help='the number of time interval for predcition, default as 12,==n_pred')
+    parser.add_argument('--simulate', default=False, help='if simulate rainfall events for training data')
+    parser.add_argument('--result_dir',type=str,default='./results/',help='the test results')
 
-    parser.add_argument('--loss_function', type=str, default='MeanSquaredError', help='Loss function')
-    parser.add_argument('--opt', type=str, default='Adam', help='optimizer')
-    parser.add_argument('--learning_rate', type=float, default=1e-3, help='learning rate')
-    parser.add_argument('--epochs', type=int, default=50, help='training epochs')
+    #train 
+    parser.add_argument('--optimizer', type=str, default='adam', help='optimizer')
+    parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
+    parser.add_argument('--epochs', type=int, default=10, help='training epochs')
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--droprate', type=float, default=0.5)
-    parser.add_argument('--act', action="store_true", help='if the environment contains control actions')
-    parser.add_argument('--seq_in', type=int, default=12,help='==n_his')
-    parser.add_argument('--seq_out', type=int, default=3,
-                        help='the number of time interval for predcition, default as 3,==n_pred')
+    parser.add_argument('--shuffle',default=True)
 
-    parser.add_argument('--enable_cuda', type=bool, default=True, help='enable CUDA, default as True')
-    parser.add_argument('--seed', type=int, default=42, help='set the random seed for stabilizing experiment results')
-    parser.add_argument('--dataset', type=str, default='shunqing', choices=['metr-la', 'pems-bay', 'shunqing'])
 
-    parser.add_argument('--time_intvl', type=int, default=5)
-    parser.add_argument('--Kt', type=int, default=3) #kernel_size
-    parser.add_argument('--stblock_num', type=int, default=2)
-    parser.add_argument('--act_func', type=str, default='glu', choices=['glu', 'gtu'])
-    parser.add_argument('--Ks', type=int, default=3, choices=[3, 2]) #Chebnet
-    parser.add_argument('--graph_conv_type', type=str, default='cheb_graph_conv',
-                        choices=['cheb_graph_conv', 'graph_conv'])
-    parser.add_argument('--gso_type', type=str, default='sym_norm_lap',
-                        choices=['sym_norm_lap', 'rw_norm_lap', 'sym_renorm_adj', 'rw_renorm_adj'])
-    parser.add_argument('--enable_bias', type=bool, default=True, help='default as True')
-    parser.add_argument('--weight_decay_rate', type=float, default=0.0005, help='weight decay (L2 penalty)')
-    parser.add_argument('--step_size', type=int, default=10)
-    parser.add_argument('--gamma', type=float, default=0.95)
-    parser.add_argument('--patience', type=int, default=30, help='early stopping patience')
+
     args = parser.parse_args()
-    print('Training configs: {}'.format(args))
-
-    # For stable experiment results
-    set_env(args.seed)
-
-    # Running in Nvidia GPU (CUDA) or CPU
-    if args.enable_cuda and torch.cuda.is_available():
-        # Set available CUDA devices
-        # This option is crucial for multiple GPUs
-        # 'cuda' ≡ 'cuda:0'
-        device = torch.device('cuda')
-    else:
-        device = torch.device('cpu')
-
-    Ko = args.seq_in - (args.Kt - 1) * 2 * args.stblock_num
-
-    # blocks: settings of channel size in st_conv_blocks and output layer,
-    # using the bottleneck design in st_conv_blocks
-    blocks = []
-    blocks.append([1])
-    for l in range(args.stblock_num):
-        blocks.append([64, 16, 64])
-    if Ko == 0:
-        blocks.append([128])
-    elif Ko > 0:
-        blocks.append([128, 128])
-    blocks.append([1])  #一个时间点
-
-    return args, device, blocks
-
-
-def data_preparate(args, device):
-    n_vertex = 105
-
-    seq = max(args.seq_in, args.seq_out)
-
-    n_events = int(max(dG.event_id)) + 1
-    train_ids = np.random.choice(np.arange(n_events), int(n_events * 0.8), replace=False)
-    test_ids = [ev for ev in range(n_events) if ev not in train_ids]
-
-    X_train, B_train, Y_train = dG.prepare(seq, train_ids)
-    X_test, B_test, Y_test = dG.prepare(seq, test_ids)
-
-    zscore = preprocessing.StandardScaler()
-    train = zscore.fit_transform(X_train)
-    test = zscore.transform(X_test)
-
-    x_train, y_train = dataloader.data_transform(train, args.seq_in, args.seq_out, device)
-    x_test, y_test = dataloader.data_transform(test, args.seq_in, args.seq_out, device)
-
-    train_data = utils.data.TensorDataset(x_train, y_train)
-    train_iter = utils.data.DataLoader(dataset=train_data, batch_size=args.batch_size, shuffle=False)
-    test_data = utils.data.TensorDataset(x_test, y_test)
-    test_iter = utils.data.DataLoader(dataset=test_data, batch_size=args.batch_size, shuffle=False)
-
-    return n_vertex, zscore, train_iter, test_iter
-
-
-def prepare_model(args, blocks, n_vertex):
-    loss = nn.MSELoss()
-    es = earlystopping.EarlyStopping(mode='min', min_delta=0.0, patience=args.patience)
-
-    if args.graph_conv_type == 'cheb_graph_conv':
-        model = models.STGCNChebGraphConv(args, blocks, n_vertex).to(device)
-    else:
-        model = models.STGCNGraphConv(args, blocks, n_vertex).to(device)
-
-    if args.opt == "rmsprop":
-        optimizer = optim.RMSprop(model.parameters(), lr=args.lr, weight_decay=args.weight_decay_rate)
-    elif args.opt == "adam":
-        optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay_rate, amsgrad=False)
-    elif args.opt == "adamw":
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay_rate, amsgrad=False)
-    else:
-        raise NotImplementedError(f'ERROR: The optimizer {args.opt} is not implemented.')
-
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
-
-    return loss, es, model, optimizer, scheduler
-
-
-def train(loss, args, optimizer, scheduler, es, model, train_iter):
-    for epoch in range(args.epochs):
-        l_sum, n = 0.0, 0  # 'l_sum' is epoch sum loss, 'n' is epoch instance number
-        model.train()
-        for x, y in tqdm.tqdm(train_iter):
-            y_pred = model(x).view(len(x), -1)  # [batch_size, num_nodes]
-            l = loss(y_pred, y)
-            optimizer.zero_grad()
-            l.backward()
-            optimizer.step()
-            scheduler.step()
-            l_sum += l.item() * y.shape[0]
-            n += y.shape[0]
-
-        # GPU memory usage
-        gpu_mem_alloc = torch.cuda.max_memory_allocated() / 1000000 if torch.cuda.is_available() else 0
-        print('Epoch: {:03d} | Lr: {:.20f} |Train loss: {:.6f} | Val loss: {:.6f} | GPU occupy: {:.6f} MiB'. \
-              format(epoch + 1, optimizer.param_groups[0]['lr'], l_sum / n,  gpu_mem_alloc))
-
-
-@torch.no_grad()
-def test(zscore, loss, model, test_iter, args):
-    model.eval()
-    test_MSE = utility.evaluate_model(model, loss, test_iter)
-    test_MAE, test_RMSE, test_WMAPE = utility.evaluate_metric(model, test_iter, zscore)
-    print(
-        f'Dataset {args.dataset:s} | Test loss {test_MSE:.6f} | MAE {test_MAE:.6f} | RMSE {test_RMSE:.6f} | WMAPE {test_WMAPE:.8f}')
-
+    print('configs: {}'.format(args))
+    return args
 
 if __name__ == "__main__":
-
-    logging.basicConfig(level=logging.INFO)
-    args, device, blocks, = get_parameters()
-
+    args = get_parameters()
     env = get_env(args.env)()
     env_args = env.get_args()
     for k, v in env_args.items():
         if k == 'act':
             v = v & args.act
         setattr(args, k, v)
+#adj
+    # edge_index = args.edges
+    # edge_index = np.array(edge_index) # [2,n]
+    edge_index = load_adj()
 
-
-    adj = np.zeros((args.edges.max() + 1, args.edges.max() + 1))
-    for u, v in args.edges:
-        adj[u, v] += 1
-
-    gso = utility.calc_gso(adj, args.gso_type)
-    if args.graph_conv_type == 'cheb_graph_conv':
-        gso = utility.calc_chebynet_gso(gso)
-    gso = gso.toarray()
-
+    swmm_start_time = time.time()
     dG = DataGenerator(env, args.seq_in, args.seq_out, args.act, args.data_dir)
     events = generate_file(env.config['swmm_input'], env.config['rainfall'])
     if args.simulate:
-        dG.generate(events, processes=args.processes, act=args.act)
+        dG.generate(events, processes=args.processes, act=args.act, seq=args.seq)
         dG.save(args.data_dir)
     else:
         dG.load(args.data_dir)
+    
+
+    seq = max(args.seq_in, args.seq_out)
+    n_events = int(max(dG.event_id)) + 1
+    #选取train和test降雨事件
+    train_ids = np.random.choice(np.arange(n_events), int(n_events * args.ratio), replace=False)
+    test_ids = [ev for ev in range(n_events) if ev not in train_ids]
+
+    X,B,Y = dG.prepare(seq,train_ids) #Y不要，B是某点降雨序列，也不要 
+    Xt,Bt,Yt = dG.prepare(seq,test_ids)
 
 
-    n_vertex, zscore, train_iter, test_iter = data_preparate(args, device)
-    loss, es, model, optimizer, scheduler = prepare_model(args, blocks, n_vertex)
-    train(loss, args, optimizer, scheduler, es, model, train_iter)
-    test(zscore, loss, model, test_iter, args)
+    #删掉第二维度, axis =2 , 5>4 (70000,12,105,4)  into  (27399,207,2,12)
+    #axis =1,4>3 ,x.shape(70000,105,4),xt.shape(20000,105,4)
+    x = np.squeeze(X,axis=1) 
+    xt = np.squeeze(Xt,axis=1)
+    # y = np.squeeze(Y,axis=2)
+    # yt = np.squeeze(Yt,axis=2)
+
+    #norm
+    x = norm(x)  #into 105,4,76614
+    xt = norm(xt)
+    
+    # x = np.transpose(x,(0,2,3,1))
+    # xt = np.transpose(xt,(0,2,3,1))
+    # y = np.transpose(y,(0,2,3,1))
+    # yt = np.transpose(yt,(0,2,3,1))
+
+    x = torch.from_numpy(x) #(76614,1,105,4)
+    xt = torch.from_numpy(xt)
+    # y = torch.from_numpy(y) #(76614,1,105,4)
+    # yt = torch.from_numpy(yt)
+
+    x_train, y_train = sliding_window(x, args.seq_in, args.seq_out)
+    x_test, y_test = sliding_window(xt, args.seq_in, args.seq_out)
+
+    # x_train, y_train = origin_window(X, args.seq_in, args.seq_out)
+    # x_test, y_test = origin_window(Xt, args.seq_in, args.seq_out)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
+
+    #train
+    train_input = np.array(x_train) # (27399, 207, 2, 12)
+    train_target = np.array(y_train) # (27399, 207, 12)
+    train_x_tensor = torch.from_numpy(train_input).type(torch.FloatTensor).to(device)  # (B, N, F, T)
+    train_target_tensor = torch.from_numpy(train_target).type(torch.FloatTensor).to(device)  # (B, N, T)
+    train_dataset_new = torch.utils.data.TensorDataset(train_x_tensor, train_target_tensor)
+    train_loader = torch.utils.data.DataLoader(train_dataset_new, batch_size=args.batch_size, shuffle=args.shuffle,drop_last=True)
+    #test
+    test_input = np.array(x_test) # (, 207, 2, 12)
+    test_target = np.array(y_test) # (, 207, 12)
+    test_x_tensor = torch.from_numpy(test_input).type(torch.FloatTensor).to(device)  # (B, N, F, T)
+    test_target_tensor = torch.from_numpy(test_target).type(torch.FloatTensor).to(device)  # (B, N, T)
+    test_dataset_new = torch.utils.data.TensorDataset(test_x_tensor, test_target_tensor)
+    test_loader = torch.utils.data.DataLoader(test_dataset_new, batch_size=args.batch_size, shuffle=args.shuffle,drop_last=True)
+
+
+    batch_size = args.batch_size
+    model = TemporalGNN(node_features=3, periods=args.seq_in, batch_size=batch_size).to(device)
+    loss_fn = torch.nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+ 
+    train_loss_list = []
+    test_loss_list = []
+    for epoch in range(args.epochs):
+        step = 0
+        loss_list = []
+         #y_hat = y_pred    ,  labels = y
+
+        for x, y in tqdm(train_loader):
+            y_pred = model(x, edge_index)         # Get model predictions
+            loss = loss_fn(y_pred, y) # Mean squared error #loss = torch.mean((y_hat-labels)**2)  sqrt to change it to rmse
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            step= step+ 1
+            loss_list.append(loss.item())
+            # if step % 100 == 0 :
+            #     print('train_loss:',sum(loss_list)/len(loss_list))
+
+        train_loss = sum(loss_list) / len(loss_list)
+        train_loss_list.append(train_loss)
+        
+        print("Epoch {} - Train Loss: {:.6f}".format(epoch+1, train_loss))
+    
+        model.eval()
+        step = 0
+    # Store for analysis
+        total_loss = []
+        for x, y in test_loader:
+            y_pred = model(x, edge_index)
+            loss = loss_fn(y_pred, y)
+            total_loss.append(loss.item())
+
+        test_loss = sum(total_loss) / len(total_loss)
+        test_loss_list.append(test_loss)
+        print("Epoch {} - Test Loss: {:.6f}".format(epoch+1, test_loss))
+
+    # print("Epoch {} train loss: {:.6f} Test Loss :{:.6f}".format(epoch+1, train_loss,test_loss))
+    plt.figure()
+# 绘制平滑后的训练损失曲线
+    plt.plot(range(1, args.epochs+1), train_loss_list, label='Train Loss')
+    plt.plot(range(1, args.epochs+1), test_loss_list, label='Test Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Test Loss ')
+    plt.grid(True)  # 添加网格线
+    plt.legend()
+    plt.savefig('loss.png')
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # x = X[..., 3:]# 输入 x 包含前三个特征（h、q_us 和 q_ds）  (78000,12,105,3)
+    # b = X[..., 3:4]  # 固定序列特征 r  (78000,12,105,1)
+    #     # 提取目标特征
+    # y = X[..., :3]  # 目标 y 包含下一个时间步的三个特征（h、q_us 和 q_ds）(78000,12,105)
+    # x_input = [x,b]   #list [(78000,12,105,3)(78000,12,105,1)]
+
+    # xt = Xt[..., [0, 1, 2]]# 输入 x 包含前三个特征（h、q_us 和 q_ds）  (78000,12,105,3)
+    # bt = Xt[..., 3]  # 固定序列特征 r  (78000,12,105,1)
+    #     # 提取目标特征
+    # yt = Xt[..., [0, 1, 2]]  # 目标 y 包含下一个时间步的三个特征（h、q_us 和 q_ds）(78000,12,105)
+    
+    # #zscore
+    # x = z_score_normalize(x)
+    # xt = z_score_normalize(xt)
+    # # 生成y
+    # y = data_produce(x,args.seq_in,device)
+    # yt = data_produce(xt,args.seq_in,device)
+
+    # # 将数组保存为.npy文件
+    # np.save(os.path.join(args.result_dir,'x.npy'), x)
+    # np.save(os.path.join(args.result_dir,'xt.npy'), xt)
+    # np.save(os.path.join(args.result_dir,'y.npy'), y)
+    # np.save(os.path.join(args.result_dir,'yt.npy'), yt)
+    # np.save(os.path.join(args.result_dir,'edgeidx.npy'), edge_index)
+    # np.save(os.path.join(args.result_dir,'train_id.npy'),np.array(train_ids))
+    # np.save(os.path.join(args.result_dir,'test_id.npy'),np.array(test_ids))
+    '''
+    根据提供的代码，看起来你使用了标准化（Standardization）的方法对数据进行了处理。为了进行反向缩放，你需要知道原始数据的均值和标准差。
+
+反向缩放的步骤如下：
+
+计算原始数据的均值和标准差。你可以使用与标准化时相同的方法计算均值和标准差。
+python
+original_means = means  # 原始数据的均值
+original_stds = stds  # 原始数据的标准差
+执行反向缩放。根据标准化公式，将标准化后的数据乘以标准差，并加上均值。
+python
+X_scaled = X  # 标准化后的数据
+X_original = X_scaled * original_stds.reshape(1, -1, 1) + original_means.reshape(1, -1, 1)
+最后，X_original 就是经过反向缩放后的原始数据。
+
+请注意，反向缩放后的数据类型可能仍然是 np.float32，你可以根据需要进行转换。另外，确保在进行反向缩放之前，original_means 和 original_stds 的值是正确的。
+    
+    '''
