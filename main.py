@@ -271,7 +271,7 @@ if __name__ == "__main__":
 
             model.eval()
             with torch.no_grad():
-                states = torch.from_numpy(states).to(device,dtype=torch.double)
+                states = torch.from_numpy(states).to(device)
                 pred = model(states,edge_index).detach().numpy()
             
             print("{} Emulation time: {}".format(name,time.time()-t0))
